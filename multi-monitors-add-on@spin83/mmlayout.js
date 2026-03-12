@@ -8,8 +8,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Layout from 'resource:///org/gnome/shell/ui/layout.js';
 
 import * as MMPanel from './mmpanel.js'
-import { g, currentExtension } from './globals.js'
-var { mmPanel } = g
+import { currentExtension } from './globals.js'
 
 var SHOW_PANEL_ID = 'show-panel';
 var ENABLE_HOT_CORNERS = 'enable-hot-corners';
@@ -38,10 +37,9 @@ export var MultiMonitorsLayoutManager = class MultiMonitorsLayoutManager {
 		this._settings = currentExtension().getSettings();
 		this._desktopSettings = currentExtension().getSettings("org.gnome.desktop.interface");
 
-		mmPanel = [];
-
 		this._monitorIds = [];
 		this.mmPanelBox = [];
+		this._panels = [];
 
 		this._monitorsChangedId = null;
 
@@ -109,7 +107,7 @@ export var MultiMonitorsLayoutManager = class MultiMonitorsLayoutManager {
 		this._disableIndicatorMirroring();
 
 		if (this._changedEnableHotCornersId) {
-			global.settings.disconnect(this._changedEnableHotCornersId);
+			this._desktopSettings.disconnect(this._changedEnableHotCornersId);
 			this._changedEnableHotCornersId = null;
 		}
 
@@ -171,16 +169,29 @@ export var MultiMonitorsLayoutManager = class MultiMonitorsLayoutManager {
 
 		panel.connect('destroy', () => this._removePanelFromMirrors(panel));
 
-		mmPanel.push(panel);
+		this._panels.push(panel);
 		this.mmPanelBox.push(mmPanelBox);
 
 		this._syncMirroredIndicators();
 	}
 
 	_popPanel() {
-		mmPanel.pop();
+		this._panels.pop();
 		let mmPanelBox = this.mmPanelBox.pop();
 		mmPanelBox.destroy();
+	}
+
+	_disconnectIndicatorDestroy(record) {
+		if (!record?.destroyId)
+			return;
+
+		try {
+			record.source.disconnect(record.destroyId);
+		} catch (e) {
+			console.debug(e);
+		}
+
+		record.destroyId = null;
 	}
 
 	_enableIndicatorMirroring() {
@@ -199,10 +210,10 @@ export var MultiMonitorsLayoutManager = class MultiMonitorsLayoutManager {
 
 	_disableIndicatorMirroring() {
 		for (let [role, record] of this._mirroredIndicators.entries()) {
-			if (record.destroyId)
-				record.source.disconnect(record.destroyId);
+			this._disconnectIndicatorDestroy(record);
 
-			for (let clone of record.clones.values()) {
+			for (let [panel, clone] of record.clones.entries()) {
+				panel?.removeFromStatusArea(role, clone);
 				try {
 					clone.destroy();
 				} catch (e) {
@@ -275,7 +286,7 @@ export var MultiMonitorsLayoutManager = class MultiMonitorsLayoutManager {
 	}
 
 	_addClonesForIndicator(role, record) {
-		mmPanel.forEach(panel => {
+		this._panels.forEach(panel => {
 			if (!panel || record.clones.has(panel))
 				return;
 
@@ -312,7 +323,8 @@ export var MultiMonitorsLayoutManager = class MultiMonitorsLayoutManager {
 		if (!record)
 			return;
 
-		for (let clone of record.clones.values()) {
+		for (let [panel, clone] of record.clones.entries()) {
+			panel?.removeFromStatusArea(role, clone);
 			try {
 				clone.destroy();
 			} catch (e) {
@@ -320,8 +332,7 @@ export var MultiMonitorsLayoutManager = class MultiMonitorsLayoutManager {
 			}
 		}
 
-		if (record.destroyId)
-			record.source.disconnect(record.destroyId);
+		this._disconnectIndicatorDestroy(record);
 
 		this._mirroredIndicators.delete(role);
 	}
