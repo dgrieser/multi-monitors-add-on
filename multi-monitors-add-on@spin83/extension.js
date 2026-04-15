@@ -57,7 +57,7 @@ export default class MultiMonitorsAddOn extends Extension {
         console.log(`Enabling ${this.metadata.name}`)
 
         if (Main.panel.statusArea.MultiMonitorsAddOn)
-            this.disable();
+            disable();
 
         this._toggleIndicatorId = this._settings.connect('changed::' + SHOW_INDICATOR_ID, this._toggleIndicator.bind(this));
         this._toggleIndicator();
@@ -68,20 +68,12 @@ export default class MultiMonitorsAddOn extends Extension {
     }
 
     disable() {
-        if (this._showPanelId) {
-            this._settings.disconnect(this._showPanelId);
-            this._showPanelId = null;
-        }
-        if (this._toggleIndicatorId) {
-            this._settings.disconnect(this._toggleIndicatorId);
-            this._toggleIndicatorId = null;
-        }
+        this._settings.disconnect(this._showPanelId);
+        this._settings.disconnect(this._toggleIndicatorId);
         this._hideIndicator();
 
-        if (this.mmLayoutManager) {
-            this.mmLayoutManager.hidePanel();
-            this.mmLayoutManager = null;
-        }
+        this.mmLayoutManager.hidePanel();
+        this.mmLayoutManager = null;
 
         console.log(`Disabled ${this.metadata.name} ...`)
     }
