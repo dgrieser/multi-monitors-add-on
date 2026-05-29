@@ -14,46 +14,213 @@ GNU General Public License for more details.
 You should have received a copy of the GNU General Public License
 along with this program; if not, visit https://www.gnu.org/licenses/.
 */
+import Clutter from 'gi://Clutter';
+import Gio from 'gi://Gio';
 import GObject from 'gi://GObject';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Panel from 'resource:///org/gnome/shell/ui/panel.js';
+import { EventEmitter } from 'resource:///org/gnome/shell/misc/signals.js';
 
-function getMainIndicators() {
-	let ret = {}
-	Object.entries(Main.panel.statusArea)
-		.forEach(([key, value]) => {
-			if (true || (key.startsWith("appindicator-") && ["IndicatorStatusTrayIcon", "IndicatorStatusIcon"].includes(value.constructor.name))) {
-				ret[key] = value;
+// --- Signal-leak guard -----------------------------------------------------
+//
+// A MultiMonitorsPanel is a full Panel.Panel, so super._init() builds a
+// complete duplicate of the top panel for the secondary monitor: quickSettings
+// (PowerToggle, BackgroundAppsToggle, screencast/remote-access indicators, ...)
+// and dateMenu. Those built-in indicators connect to session-long singletons
+// (Main.sessionMode, St.Settings, notification sources, per-toggle DBus
+// proxies) and never disconnect, because the real top panel lives for the
+// whole session. Our mirror panels are created/destroyed on every
+// monitors-changed / enable-disable, so each teardown leaks those handlers.
+// They then keep firing on the disposed indicators forever:
+//   "Object Gjs_status_system_PowerToggle ... has been already disposed"  (spam)
+//   "TypeError: ... this._settings is null"  (dateMenu)
+//
+// We can't make GNOME's indicators clean up after themselves, so instead we
+// record every signal connection made while the panel is built and disconnect
+// them all when the panel is destroyed. sessionMode (and friends) are
+// EventEmitters, the proxies/St widgets are GObjects, so both prototypes are
+// patched for the synchronous build window only.
+
+let _captureSink = null;
+let _captureDepth = 0;
+let _patchedMethods = [];
+
+function _wrapConnect(orig) {
+	return function (...args) {
+		const id = orig.apply(this, args);
+		if (_captureSink) {
+			try {
+				_captureSink.push({ target: this, id });
+			} catch (e) {
+				// never let bookkeeping break a real connect()
 			}
-		})
-	return ret;
+		}
+		return id;
+	};
+}
+
+// Override proto[name] with a capturing wrapper. Tolerates a non-writable
+// method (degrades to "not captured" instead of throwing in strict mode) and
+// remembers the original so it can be restored exactly.
+function _patchConnect(proto, name) {
+	const orig = proto[name];
+	if (typeof orig !== 'function')
+		return;
+	try {
+		proto[name] = _wrapConnect(orig);
+		_patchedMethods.push({ proto, name, orig });
+	} catch (e) {
+		// method is read-only on this GJS build; skip silently
+	}
+}
+
+function _captureConnections(buildFn) {
+	const captured = [];
+
+	if (_captureDepth === 0) {
+		_patchedMethods = [];
+		_patchConnect(GObject.Object.prototype, 'connect');
+		_patchConnect(GObject.Object.prototype, 'connect_after');
+		_patchConnect(EventEmitter.prototype, 'connect');
+	}
+
+	const prevSink = _captureSink;
+	_captureSink = captured;
+	_captureDepth++;
+
+	try {
+		buildFn();
+	} finally {
+		_captureSink = prevSink;
+		_captureDepth--;
+
+		if (_captureDepth === 0) {
+			for (const { proto, name, orig } of _patchedMethods) {
+				try {
+					proto[name] = orig;
+				} catch (e) {
+					// unreachable in practice: we only patched writable methods
+				}
+			}
+			_patchedMethods = [];
+		}
+	}
+
+	return captured;
 }
 
 export var MultiMonitorsPanel = (() => {
 	let MultiMonitorsPanel = class MultiMonitorsPanel extends Panel.Panel {
 		_init(monitorIndex, mmPanelBox) {
-			super._init();
+			// Build the full duplicate panel, recording every signal it wires
+			// up so we can unwire it again on destroy (see notes above).
+			this._mmCapturedConnections = _captureConnections(() => {
+				super._init();
+			});
+			this._mmProxies = this._mmCollectProxies();
+
 			Main.layoutManager.panelBox.remove_child(this);
 			mmPanelBox.panelBox.add_child(this);
 			this.monitorIndex = monitorIndex;
 			this.connect('destroy', this._onDestroy.bind(this));
-			// this._syncIndicators()
 		}
 
-		_syncIndicators() {
-			// WIP!
-			Object.entries(getMainIndicators()).forEach(([key, value]) => {
+		// Per-toggle Gio.DBusProxy objects (e.g. PowerToggle._proxy watching
+		// UPower) connect g-properties-changed -> _sync() only after their
+		// async DBus init completes, i.e. after super._init() returns, so the
+		// build-time capture above never sees them. They are private to each
+		// duplicated indicator, so the safe teardown is to dispose them.
+		_mmCollectProxies() {
+			const proxies = new Set();
+			const seen = new Set();
+
+			const visit = (node, depth) => {
+				if (!node || depth > 6 || seen.has(node))
+					return;
+				seen.add(node);
+
+				let proxy;
 				try {
-					this.addToStatusArea(key, value, 1);
+					proxy = node._proxy;
 				} catch (e) {
-					console.warn("Skipping role: " + key);
+					proxy = null;
 				}
-			})
+				if (proxy instanceof Gio.DBusProxy)
+					proxies.add(proxy);
+
+				// descend into a panel menu (the toggles live there, not in
+				// the panel actor tree)
+				let menu;
+				try {
+					menu = node.menu;
+				} catch (e) {
+					menu = null;
+				}
+				if (menu) {
+					for (const key of ['box', '_grid', 'actor']) {
+						let sub;
+						try {
+							sub = menu[key];
+						} catch (e) {
+							continue;
+						}
+						if (sub)
+							visit(sub, depth + 1);
+					}
+				}
+
+				let children;
+				try {
+					children = node.get_children ? node.get_children() : null;
+				} catch (e) {
+					children = null;
+				}
+				if (children)
+					children.forEach(child => visit(child, depth + 1));
+			};
+
+			visit(this, 0);
+			try {
+				for (const role in this.statusArea)
+					visit(this.statusArea[role], 0);
+			} catch (e) {
+				// statusArea not available; nothing to collect
+			}
+
+			return [...proxies];
+		}
+
+		_mmTeardown() {
+			if (this._mmCapturedConnections) {
+				for (const { target, id } of this._mmCapturedConnections) {
+					try {
+						if (target instanceof GObject.Object &&
+							!GObject.signal_handler_is_connected(target, id))
+							continue;
+						target.disconnect(id);
+					} catch (e) {
+						// target already disposed / id already gone
+					}
+				}
+				this._mmCapturedConnections = null;
+			}
+
+			if (this._mmProxies) {
+				for (const proxy of this._mmProxies) {
+					try {
+						proxy.run_dispose();
+					} catch (e) {
+						// already disposed
+					}
+				}
+				this._mmProxies = null;
+			}
 		}
 
 		_onDestroy() {
 			Main.ctrlAltTabManager.removeGroup(this);
+			this._mmTeardown();
 		}
 
 		vfunc_get_preferred_width(_forHeight) {
