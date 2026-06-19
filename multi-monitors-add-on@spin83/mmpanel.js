@@ -118,7 +118,6 @@ export var MultiMonitorsPanel = (() => {
 			this._mmCapturedConnections = _captureConnections(() => {
 				super._init();
 			});
-			this._mmProxies = this._mmCollectProxies();
 
 			Main.layoutManager.panelBox.remove_child(this);
 			mmPanelBox.panelBox.add_child(this);
@@ -194,10 +193,14 @@ export var MultiMonitorsPanel = (() => {
 		_mmTeardown() {
 			if (this._mmCapturedConnections) {
 				for (const { target, id } of this._mmCapturedConnections) {
+					// One touch per target: disconnect directly inside try/catch.
+					// The old signal_handler_is_connected() pre-check touched the
+					// wrapper an extra time, and on an already-disposed target
+					// that probe itself logged a "has been already disposed"
+					// stack trace (mmpanel.js:199) on every monitor unplug. Ids
+					// are unique per connect(), so there is no double-disconnect
+					// to guard against.
 					try {
-						if (target instanceof GObject.Object &&
-							!GObject.signal_handler_is_connected(target, id))
-							continue;
 						target.disconnect(id);
 					} catch (e) {
 						// target already disposed / id already gone
@@ -206,15 +209,18 @@ export var MultiMonitorsPanel = (() => {
 				this._mmCapturedConnections = null;
 			}
 
-			if (this._mmProxies) {
-				for (const proxy of this._mmProxies) {
-					try {
-						proxy.run_dispose();
-					} catch (e) {
-						// already disposed
-					}
+			// Collect proxies HERE, not at construction. A toggle's
+			// Gio.DBusProxy is created during async DBus init that finishes
+			// AFTER _init() returns, so collecting at build time missed them and
+			// their g-properties-changed -> _sync() handlers leaked. We run on
+			// 'destroy', emitted before the actor children are disposed, so the
+			// tree is still walkable and every proxy that ever attached is seen.
+			for (const proxy of this._mmCollectProxies()) {
+				try {
+					proxy.run_dispose();
+				} catch (e) {
+					// already disposed
 				}
-				this._mmProxies = null;
 			}
 		}
 

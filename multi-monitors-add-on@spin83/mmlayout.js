@@ -109,7 +109,12 @@ export var MultiMonitorsLayoutManager = class MultiMonitorsLayoutManager {
 		this._disableIndicatorMirroring();
 
 		if (this._changedEnableHotCornersId) {
-			global.settings.disconnect(this._changedEnableHotCornersId);
+			// Connected on _desktopSettings (org.gnome.desktop.interface) in
+			// showPanel(); must be disconnected from the same object. The old
+			// code used global.settings (a different GSettings), so the id was
+			// foreign there -> GLib critical, no-op, and the handler leaked on
+			// every enable/disable cycle.
+			this._desktopSettings.disconnect(this._changedEnableHotCornersId);
 			this._changedEnableHotCornersId = null;
 		}
 
