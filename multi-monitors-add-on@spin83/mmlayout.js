@@ -183,7 +183,17 @@ export var MultiMonitorsLayoutManager = class MultiMonitorsLayoutManager {
 	}
 
 	_popPanel() {
-		mmPanel.pop();
+		// Tear the panel down BEFORE destroying its container. _mmTeardown
+		// disconnects captured handlers and disposes DBus proxies; running it
+		// here, while the actor tree is still alive, means every captured
+		// target is still valid. Previously teardown only ran from the panel's
+		// 'destroy' signal, which fires after panelBox.destroy() has already
+		// freed the child widgets -> disconnect touched disposed wrappers and
+		// logged "has been already disposed" once per handler. _mmTeardown is
+		// idempotent, so the 'destroy' handler running it again is a no-op.
+		let panel = mmPanel.pop();
+		if (panel && panel._mmTeardown)
+			panel._mmTeardown();
 		let mmPanelBox = this.mmPanelBox.pop();
 		mmPanelBox.destroy();
 	}

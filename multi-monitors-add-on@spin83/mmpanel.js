@@ -191,15 +191,20 @@ export var MultiMonitorsPanel = (() => {
 		}
 
 		_mmTeardown() {
+			// Idempotent. _popPanel() calls this proactively while the actor
+			// tree is still alive; the panel's own 'destroy' handler then calls
+			// it again as a safety net. Run once.
+			if (this._mmTornDown)
+				return;
+			this._mmTornDown = true;
+
 			if (this._mmCapturedConnections) {
 				for (const { target, id } of this._mmCapturedConnections) {
-					// One touch per target: disconnect directly inside try/catch.
-					// The old signal_handler_is_connected() pre-check touched the
-					// wrapper an extra time, and on an already-disposed target
-					// that probe itself logged a "has been already disposed"
-					// stack trace (mmpanel.js:199) on every monitor unplug. Ids
-					// are unique per connect(), so there is no double-disconnect
-					// to guard against.
+					// Single touch per target. Ids are unique per connect(), so
+					// there is no double-disconnect to guard against. Because
+					// _popPanel() tears down before destroying the tree, target
+					// is normally still alive here; the try/catch only covers
+					// transients already disposed during the panel's lifetime.
 					try {
 						target.disconnect(id);
 					} catch (e) {
@@ -209,12 +214,11 @@ export var MultiMonitorsPanel = (() => {
 				this._mmCapturedConnections = null;
 			}
 
-			// Collect proxies HERE, not at construction. A toggle's
-			// Gio.DBusProxy is created during async DBus init that finishes
-			// AFTER _init() returns, so collecting at build time missed them and
-			// their g-properties-changed -> _sync() handlers leaked. We run on
-			// 'destroy', emitted before the actor children are disposed, so the
-			// tree is still walkable and every proxy that ever attached is seen.
+			// Dispose the per-toggle Gio.DBusProxy objects. They are created
+			// during async DBus init that finishes AFTER _init() returns, so we
+			// collect at teardown (not build time) to catch every one. This must
+			// run while the actor tree is still walkable -> _popPanel() tears
+			// down before panelBox.destroy(), so the subtree is still intact.
 			for (const proxy of this._mmCollectProxies()) {
 				try {
 					proxy.run_dispose();
