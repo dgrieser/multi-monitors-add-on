@@ -119,6 +119,21 @@ export var MultiMonitorsPanel = (() => {
 				super._init();
 			});
 
+			// Some captured targets are actors GNOME disposes during the
+			// panel's life (e.g. the keyboard LayoutMenuItem, rebuilt on every
+			// input-source change). Watch each actor target's 'destroy' and mark
+			// its entry dead, so teardown never touches a freed wrapper -- that
+			// was the "already disposed" / "no handler with id" spam. Long-lived
+			// actor targets (the genuine leaks, e.g. handlers left on the real
+			// panel) are never destroyed, so their entries survive to teardown
+			// and get disconnected. Non-actor singletons need no watch.
+			for (const entry of this._mmCapturedConnections) {
+				if (entry.target instanceof Clutter.Actor)
+					entry.watchId = entry.target.connect('destroy', () => {
+						entry.dead = true;
+					});
+			}
+
 			Main.layoutManager.panelBox.remove_child(this);
 			mmPanelBox.panelBox.add_child(this);
 			this.monitorIndex = monitorIndex;
@@ -199,22 +214,19 @@ export var MultiMonitorsPanel = (() => {
 			this._mmTornDown = true;
 
 			if (this._mmCapturedConnections) {
-				for (const { target, id } of this._mmCapturedConnections) {
-					// Skip Clutter actors. Their signal handlers are freed
-					// automatically when the actor is destroyed -- both the
-					// panel's own widgets and the transient menu items GNOME
-					// rebuilds during the panel's life (e.g. the keyboard
-					// LayoutMenuItem, recreated on every input-source change).
-					// Disconnecting those by hand is unnecessary and, once the
-					// actor is disposed, only emits "already disposed" /
-					// "no handler with id" spam. The genuine leaks we must undo
-					// are connections to long-lived NON-actor singletons
-					// (sessionMode, St.Settings, GSettings), still alive here.
-					if (target instanceof Clutter.Actor)
+				for (const entry of this._mmCapturedConnections) {
+					const { target, id, watchId, dead } = entry;
+					// Actor target already destroyed during the panel's life:
+					// its handlers went with it, so there is nothing to undo and
+					// touching the freed wrapper would only spam.
+					if (dead)
 						continue;
 					try {
-						// Live GObject: skip a stale id so disconnect() can't
-						// raise a "no handler with id" critical. EventEmitter
+						// The actor is still alive -- drop our destroy watch.
+						if (watchId)
+							target.disconnect(watchId);
+						// For a live GObject, skip a stale id so disconnect()
+						// can't raise a "no handler with id" critical. EventEmitter
 						// targets short-circuit past this and disconnect directly
 						// (a safe no-op if the handler is already gone).
 						if (target instanceof GObject.Object &&
