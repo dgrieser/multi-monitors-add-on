@@ -200,12 +200,26 @@ export var MultiMonitorsPanel = (() => {
 
 			if (this._mmCapturedConnections) {
 				for (const { target, id } of this._mmCapturedConnections) {
-					// Single touch per target. Ids are unique per connect(), so
-					// there is no double-disconnect to guard against. Because
-					// _popPanel() tears down before destroying the tree, target
-					// is normally still alive here; the try/catch only covers
-					// transients already disposed during the panel's lifetime.
+					// Skip Clutter actors. Their signal handlers are freed
+					// automatically when the actor is destroyed -- both the
+					// panel's own widgets and the transient menu items GNOME
+					// rebuilds during the panel's life (e.g. the keyboard
+					// LayoutMenuItem, recreated on every input-source change).
+					// Disconnecting those by hand is unnecessary and, once the
+					// actor is disposed, only emits "already disposed" /
+					// "no handler with id" spam. The genuine leaks we must undo
+					// are connections to long-lived NON-actor singletons
+					// (sessionMode, St.Settings, GSettings), still alive here.
+					if (target instanceof Clutter.Actor)
+						continue;
 					try {
+						// Live GObject: skip a stale id so disconnect() can't
+						// raise a "no handler with id" critical. EventEmitter
+						// targets short-circuit past this and disconnect directly
+						// (a safe no-op if the handler is already gone).
+						if (target instanceof GObject.Object &&
+							!GObject.signal_handler_is_connected(target, id))
+							continue;
 						target.disconnect(id);
 					} catch (e) {
 						// target already disposed / id already gone
