@@ -140,19 +140,38 @@ export var MultiMonitorsPanel = (() => {
 			this.connect('destroy', this._onDestroy.bind(this));
 		}
 
-		// Per-toggle Gio.DBusProxy objects (e.g. PowerToggle._proxy watching
-		// UPower) connect g-properties-changed -> _sync() only after their
-		// async DBus init completes, i.e. after super._init() returns, so the
-		// build-time capture above never sees them. They are private to each
-		// duplicated indicator, so the safe teardown is to dispose them.
-		_mmCollectProxies() {
+		// One walk of the panel subtree (run from _mmTeardown while the tree is
+		// still alive) that does both teardown cleanups the build-time capture
+		// can't reach, because both happen AFTER super._init() returns:
+		//
+		//  1. Collect each per-toggle Gio.DBusProxy (e.g. PowerToggle._proxy
+		//     watching UPower), created during async DBus init -> returned so
+		//     the caller can run_dispose() it.
+		//
+		//  2. Sever connectObject() handlers the indicators own on long-lived
+		//     singletons. thunderbolt/backgroundApps connect to Main.sessionMode
+		//     'updated' after _init(); left connected, they fire on the next
+		//     session-mode change (screen unlock) and touch the disposed
+		//     indicator -- the residual lock-time spam. disconnectObject() is
+		//     keyed by owner identity: a no-op for nodes that never connected,
+		//     and it never affects the real panel's indicators (other owners).
+		_mmReapIndicatorLeaks() {
 			const proxies = new Set();
 			const seen = new Set();
+			const emitters = [Main.sessionMode];
 
 			const visit = (node, depth) => {
 				if (!node || depth > 6 || seen.has(node))
 					return;
 				seen.add(node);
+
+				for (const emitter of emitters) {
+					try {
+						emitter?.disconnectObject?.(node);
+					} catch (e) {
+						// emitter unavailable / nothing tracked for this node
+					}
+				}
 
 				let proxy;
 				try {
@@ -245,7 +264,7 @@ export var MultiMonitorsPanel = (() => {
 			// collect at teardown (not build time) to catch every one. This must
 			// run while the actor tree is still walkable -> _popPanel() tears
 			// down before panelBox.destroy(), so the subtree is still intact.
-			for (const proxy of this._mmCollectProxies()) {
+			for (const proxy of this._mmReapIndicatorLeaks()) {
 				try {
 					proxy.run_dispose();
 				} catch (e) {
