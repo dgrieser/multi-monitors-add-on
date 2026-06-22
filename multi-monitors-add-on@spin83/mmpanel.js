@@ -16,6 +16,7 @@ along with this program; if not, visit https://www.gnu.org/licenses/.
 */
 import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
+import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -110,6 +111,68 @@ function _captureConnections(buildFn) {
 	return captured;
 }
 
+// --- Late sessionMode capture ----------------------------------------------
+//
+// QuickSettings._setupIndicators() (panel.js) is async: after `await
+// import(...)` it builds thunderbolt / backgroundApps / system / ... AFTER
+// super._init() returns -- i.e. outside the synchronous capture above. Those
+// indicators do a plain `Main.sessionMode.connect('updated', ...)` whose id
+// GNOME discards and never disconnects (the real panel lives forever, so it
+// doesn't care). For our duplicate panels the handler lingers on sessionMode
+// after the panel is destroyed and fires _sync()/_syncVisibility() on the
+// disposed indicator at the next session-mode change (screen lock/unlock):
+//   "Object St.Icon ... already disposed", "Gio.DBusProxy ... already disposed"
+//
+// A plain connect() can only be undone by its id, so we record the ids of
+// connects made on Main.sessionMode during the async construction window. The
+// patch is on the sessionMode INSTANCE (not the prototype), so it is scoped to
+// that one singleton and cannot touch other emitters. Captured handlers are
+// disconnected whenever a panel is torn down (see _mmTeardown). Disconnecting a
+// still-live panel's handler too is harmless -- it only toggles indicator
+// visibility on the lock screen -- and it is never re-added.
+//
+// Caveat: with several monitors the panels' async builds interleave, so a
+// captured id can't be attributed to one panel; we disconnect them as a group.
+let _mmSessionCaptureRefs = 0;
+let _mmSessionConnectOrig = null;
+let _mmSessionCaptures = [];
+
+function _beginSessionCapture() {
+	if (_mmSessionCaptureRefs++ > 0)
+		return;
+	const sessionMode = Main.sessionMode;
+	_mmSessionConnectOrig = sessionMode.connect;
+	sessionMode.connect = function (...args) {
+		const id = _mmSessionConnectOrig.apply(this, args);
+		try {
+			_mmSessionCaptures.push(id);
+		} catch (e) {
+			// never let bookkeeping break a real connect()
+		}
+		return id;
+	};
+}
+
+function _endSessionCapture() {
+	if (_mmSessionCaptureRefs === 0 || --_mmSessionCaptureRefs > 0)
+		return;
+	// Remove our own-property override, restoring the inherited prototype method.
+	delete Main.sessionMode.connect;
+	_mmSessionConnectOrig = null;
+}
+
+function _disconnectSessionCaptures() {
+	const ids = _mmSessionCaptures;
+	_mmSessionCaptures = [];
+	for (const id of ids) {
+		try {
+			Main.sessionMode.disconnect(id);
+		} catch (e) {
+			// already disconnected / id gone
+		}
+	}
+}
+
 export var MultiMonitorsPanel = (() => {
 	let MultiMonitorsPanel = class MultiMonitorsPanel extends Panel.Panel {
 		_init(monitorIndex, mmPanelBox) {
@@ -134,44 +197,35 @@ export var MultiMonitorsPanel = (() => {
 					});
 			}
 
+			// Capture sessionMode connects made by the async-built indicators
+			// (see notes above). Keep capturing until the construction settles
+			// on the next low-priority idle, then restore the instance method.
+			_beginSessionCapture();
+			this._mmSessionDrainId = GLib.idle_add(GLib.PRIORITY_LOW, () => {
+				this._mmSessionDrainId = 0;
+				_endSessionCapture();
+				return GLib.SOURCE_REMOVE;
+			});
+
 			Main.layoutManager.panelBox.remove_child(this);
 			mmPanelBox.panelBox.add_child(this);
 			this.monitorIndex = monitorIndex;
 			this.connect('destroy', this._onDestroy.bind(this));
 		}
 
-		// One walk of the panel subtree (run from _mmTeardown while the tree is
-		// still alive) that does both teardown cleanups the build-time capture
-		// can't reach, because both happen AFTER super._init() returns:
-		//
-		//  1. Collect each per-toggle Gio.DBusProxy (e.g. PowerToggle._proxy
-		//     watching UPower), created during async DBus init -> returned so
-		//     the caller can run_dispose() it.
-		//
-		//  2. Sever connectObject() handlers the indicators own on long-lived
-		//     singletons. thunderbolt/backgroundApps connect to Main.sessionMode
-		//     'updated' after _init(); left connected, they fire on the next
-		//     session-mode change (screen unlock) and touch the disposed
-		//     indicator -- the residual lock-time spam. disconnectObject() is
-		//     keyed by owner identity: a no-op for nodes that never connected,
-		//     and it never affects the real panel's indicators (other owners).
-		_mmReapIndicatorLeaks() {
+		// Per-toggle Gio.DBusProxy objects (e.g. PowerToggle._proxy watching
+		// UPower) connect g-properties-changed -> _sync() only after their
+		// async DBus init completes, i.e. after super._init() returns, so the
+		// build-time capture above never sees them. They are private to each
+		// duplicated indicator, so the safe teardown is to dispose them.
+		_mmCollectProxies() {
 			const proxies = new Set();
 			const seen = new Set();
-			const emitters = [Main.sessionMode];
 
 			const visit = (node, depth) => {
 				if (!node || depth > 6 || seen.has(node))
 					return;
 				seen.add(node);
-
-				for (const emitter of emitters) {
-					try {
-						emitter?.disconnectObject?.(node);
-					} catch (e) {
-						// emitter unavailable / nothing tracked for this node
-					}
-				}
 
 				let proxy;
 				try {
@@ -232,6 +286,18 @@ export var MultiMonitorsPanel = (() => {
 				return;
 			this._mmTornDown = true;
 
+			// Balance the sessionMode capture. If the drain idle is still
+			// pending (panel destroyed before construction settled), cancel it
+			// and release our ref now so the instance patch is restored.
+			if (this._mmSessionDrainId) {
+				GLib.source_remove(this._mmSessionDrainId);
+				this._mmSessionDrainId = 0;
+				_endSessionCapture();
+			}
+			// Disconnect the async-built indicators' sessionMode handlers that
+			// would otherwise fire on this now-disposed panel at the next lock.
+			_disconnectSessionCaptures();
+
 			if (this._mmCapturedConnections) {
 				for (const entry of this._mmCapturedConnections) {
 					const { target, id, watchId, dead } = entry;
@@ -264,7 +330,7 @@ export var MultiMonitorsPanel = (() => {
 			// collect at teardown (not build time) to catch every one. This must
 			// run while the actor tree is still walkable -> _popPanel() tears
 			// down before panelBox.destroy(), so the subtree is still intact.
-			for (const proxy of this._mmReapIndicatorLeaks()) {
+			for (const proxy of this._mmCollectProxies()) {
 				try {
 					proxy.run_dispose();
 				} catch (e) {
