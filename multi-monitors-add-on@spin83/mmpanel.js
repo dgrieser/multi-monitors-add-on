@@ -306,6 +306,13 @@ export var MultiMonitorsPanel = (() => {
 					// touching the freed wrapper would only spam.
 					if (dead)
 						continue;
+					// Gio.DBusProxy targets are reaped wholesale by run_dispose()
+					// below. A proxy recreated/disposed mid-life has no 'destroy'
+					// signal to prune it via the dead flag, so probing it here
+					// with signal_handler_is_connected() would spam "already
+					// disposed". Skip them; run_dispose() covers the live ones.
+					if (target instanceof Gio.DBusProxy)
+						continue;
 					try {
 						// The actor is still alive -- drop our destroy watch.
 						if (watchId)
