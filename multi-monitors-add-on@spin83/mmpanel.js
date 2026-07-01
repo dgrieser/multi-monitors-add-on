@@ -18,10 +18,13 @@ import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import 'gi://GnomeBluetooth?version=3.0';
+import GnomeBluetooth from 'gi://GnomeBluetooth';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Panel from 'resource:///org/gnome/shell/ui/panel.js';
 import { EventEmitter } from 'resource:///org/gnome/shell/misc/signals.js';
+import { disconnectObject, debugGetSignalTrackers } from 'resource:///org/gnome/shell/misc/signalTracker.js';
 
 // --- Signal-leak guard -----------------------------------------------------
 //
@@ -213,13 +216,22 @@ export var MultiMonitorsPanel = (() => {
 			this.connect('destroy', this._onDestroy.bind(this));
 		}
 
-		// Per-toggle Gio.DBusProxy objects (e.g. PowerToggle._proxy watching
-		// UPower) connect g-properties-changed -> _sync() only after their
-		// async DBus init completes, i.e. after super._init() returns, so the
-		// build-time capture above never sees them. They are private to each
-		// duplicated indicator, so the safe teardown is to dispose them.
-		_mmCollectProxies() {
-			const proxies = new Set();
+		// Collect per-indicator backend GObjects to run_dispose() at teardown.
+		// They are wired up during async DBus/init that finishes AFTER
+		// super._init() returns, so the build-time capture never sees them, and
+		// they are owned by (private to) each duplicated indicator, so disposing
+		// them is safe:
+		//   node._proxy  - a Gio.DBusProxy (e.g. PowerToggle watching UPower)
+		//   node._client - a GnomeBluetooth.Client, created per bluetooth
+		//                  indicator with plain connect()s to notify::default-
+		//                  adapter-* whose ids are discarded; it survives the
+		//                  panel and keeps firing _sync() on the disposed St.Icon
+		//                  (the dominant "St.Icon already disposed" spam).
+		// NOTE: only per-indicator backends. Shared singletons (network's NM
+		// client, volume's Gvc mixer) must NOT be disposed -- their leaked
+		// handlers are cleaned by owner via the signal tracker in _mmTeardown.
+		_mmCollectDisposables() {
+			const disposables = new Set();
 			const seen = new Set();
 
 			const visit = (node, depth) => {
@@ -234,7 +246,16 @@ export var MultiMonitorsPanel = (() => {
 					proxy = null;
 				}
 				if (proxy instanceof Gio.DBusProxy)
-					proxies.add(proxy);
+					disposables.add(proxy);
+
+				let client;
+				try {
+					client = node._client;
+				} catch (e) {
+					client = null;
+				}
+				if (client instanceof GnomeBluetooth.Client)
+					disposables.add(client);
 
 				// descend into a panel menu (the toggles live there, not in
 				// the panel actor tree)
@@ -275,7 +296,7 @@ export var MultiMonitorsPanel = (() => {
 				// statusArea not available; nothing to collect
 			}
 
-			return [...proxies];
+			return [...disposables];
 		}
 
 		_mmTeardown() {
@@ -332,17 +353,44 @@ export var MultiMonitorsPanel = (() => {
 				this._mmCapturedConnections = null;
 			}
 
-			// Dispose the per-toggle Gio.DBusProxy objects. They are created
-			// during async DBus init that finishes AFTER _init() returns, so we
-			// collect at teardown (not build time) to catch every one. This must
-			// run while the actor tree is still walkable -> _popPanel() tears
-			// down before panelBox.destroy(), so the subtree is still intact.
-			for (const proxy of this._mmCollectProxies()) {
+			// Dispose the per-indicator backend GObjects (Gio.DBusProxy,
+			// GnomeBluetooth.Client). They are created during async init after
+			// super._init() returns, so we collect at teardown (not build time)
+			// to catch every one. Must run while the actor tree is still
+			// walkable -> _popPanel() tears down before panelBox.destroy().
+			for (const obj of this._mmCollectDisposables()) {
 				try {
-					proxy.run_dispose();
+					obj.run_dispose();
 				} catch (e) {
 					// already disposed
 				}
+			}
+
+			// Disconnect connectObject() handlers whose owner is one of this
+			// panel's actors, across every emitter. The async-built indicators
+			// register handlers on SHARED singletons via connectObject with the
+			// indicator/slider as owner: volume -> Gvc mixer control, network ->
+			// NM.Client, the stream sliders -> their streams. The emitter's
+			// signal tracker keeps that owner as a Map key, so it never
+			// finalizes after the panel dies and its handlers keep firing on the
+			// disposed St.Icon (the volume.js / network.js spam). Untracking by
+			// owner disconnects them and releases the owner. We only touch owners
+			// contained in THIS panel, so the real panel's indicators (whose
+			// owners live elsewhere) are never affected.
+			try {
+				for (const [emitter, tracker] of [...debugGetSignalTrackers()]) {
+					for (const owner of [...tracker._map.keys()]) {
+						if (owner instanceof Clutter.Actor && this.contains(owner)) {
+							try {
+								disconnectObject(emitter, owner);
+							} catch (e) {
+								// emitter/owner already gone
+							}
+						}
+					}
+				}
+			} catch (e) {
+				// signalTracker debug internals unavailable / changed
 			}
 		}
 
