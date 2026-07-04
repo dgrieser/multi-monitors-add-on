@@ -254,8 +254,15 @@ export var MultiMonitorsPanel = (() => {
 				} catch (e) {
 					client = null;
 				}
-				if (client instanceof GnomeBluetooth.Client)
-					disposables.add(client);
+				// Per-indicator GnomeBluetooth.Client: detect by GObject type
+				// name as well as instanceof, so a namespace-identity mismatch on
+				// the imported module can't silently skip it. 'Bluetooth' never
+				// matches NM's shared client ('NMClient'), so it stays untouched.
+				if (client instanceof GObject.Object) {
+					const gname = client.constructor?.$gtype?.name ?? '';
+					if (client instanceof GnomeBluetooth.Client || gname.includes('Bluetooth'))
+						disposables.add(client);
+				}
 
 				// descend into a panel menu (the toggles live there, not in
 				// the panel actor tree)
@@ -286,6 +293,30 @@ export var MultiMonitorsPanel = (() => {
 				}
 				if (children)
 					children.forEach(child => visit(child, depth + 1));
+
+				// Also descend into private actor-valued fields. Some indicators
+				// (e.g. the bluetooth SystemIndicator held by quickSettings.
+				// _bluetooth) sit in fields that get_children may not surface.
+				// Restrict to '_'-prefixed names to avoid triggering public
+				// getters with side effects.
+				let props;
+				try {
+					props = Object.getOwnPropertyNames(node);
+				} catch (e) {
+					props = [];
+				}
+				for (const p of props) {
+					if (!p.startsWith('_') || p === '__proto__')
+						continue;
+					let val;
+					try {
+						val = node[p];
+					} catch (e) {
+						continue;
+					}
+					if (val instanceof Clutter.Actor)
+						visit(val, depth + 1);
+				}
 			};
 
 			visit(this, 0);
@@ -295,6 +326,10 @@ export var MultiMonitorsPanel = (() => {
 			} catch (e) {
 				// statusArea not available; nothing to collect
 			}
+
+			const btCount = [...disposables].filter(
+				o => (o.constructor?.$gtype?.name ?? '').includes('Bluetooth')).length;
+			console.log(`mm-diag: teardown walk nodes=${seen.size} disposables=${disposables.size} bluetoothClients=${btCount}`);
 
 			return [...disposables];
 		}
