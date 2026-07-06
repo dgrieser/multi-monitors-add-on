@@ -18,8 +18,6 @@ import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
-import 'gi://GnomeBluetooth?version=3.0';
-import GnomeBluetooth from 'gi://GnomeBluetooth';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Panel from 'resource:///org/gnome/shell/ui/panel.js';
@@ -216,20 +214,15 @@ export var MultiMonitorsPanel = (() => {
 			this.connect('destroy', this._onDestroy.bind(this));
 		}
 
-		// Collect per-indicator backend GObjects to run_dispose() at teardown.
-		// They are wired up during async DBus/init that finishes AFTER
-		// super._init() returns, so the build-time capture never sees them, and
-		// they are owned by (private to) each duplicated indicator, so disposing
-		// them is safe:
-		//   node._proxy  - a Gio.DBusProxy (e.g. PowerToggle watching UPower)
-		//   node._client - a GnomeBluetooth.Client, created per bluetooth
-		//                  indicator with plain connect()s to notify::default-
-		//                  adapter-* whose ids are discarded; it survives the
-		//                  panel and keeps firing _sync() on the disposed St.Icon
-		//                  (the dominant "St.Icon already disposed" spam).
-		// NOTE: only per-indicator backends. Shared singletons (network's NM
-		// client, volume's Gvc mixer) must NOT be disposed -- their leaked
-		// handlers are cleaned by owner via the signal tracker in _mmTeardown.
+		// Collect per-toggle Gio.DBusProxy objects (e.g. PowerToggle._proxy
+		// watching UPower) to run_dispose() at teardown. They connect
+		// g-properties-changed -> _sync() only after their async DBus init, i.e.
+		// after super._init() returns, so the build-time capture never sees
+		// them; they are private to each duplicated toggle, so disposing is safe.
+		// (The bluetooth SystemIndicator's own client sits on a private field the
+		// walk doesn't reach -- it's disposed directly in _mmTeardown. Shared
+		// singletons -- NM client, Gvc mixer -- are never disposed; their leaked
+		// handlers are cleaned by owner via the signal tracker in _mmTeardown.)
 		_mmCollectDisposables() {
 			const disposables = new Set();
 			const seen = new Set();
@@ -247,22 +240,6 @@ export var MultiMonitorsPanel = (() => {
 				}
 				if (proxy instanceof Gio.DBusProxy)
 					disposables.add(proxy);
-
-				let client;
-				try {
-					client = node._client;
-				} catch (e) {
-					client = null;
-				}
-				// Per-indicator GnomeBluetooth.Client: detect by GObject type
-				// name as well as instanceof, so a namespace-identity mismatch on
-				// the imported module can't silently skip it. 'Bluetooth' never
-				// matches NM's shared client ('NMClient'), so it stays untouched.
-				if (client instanceof GObject.Object) {
-					const gname = client.constructor?.$gtype?.name ?? '';
-					if (client instanceof GnomeBluetooth.Client || gname.includes('Bluetooth'))
-						disposables.add(client);
-				}
 
 				// descend into a panel menu (the toggles live there, not in
 				// the panel actor tree)
@@ -360,11 +337,11 @@ export var MultiMonitorsPanel = (() => {
 				this._mmCapturedConnections = null;
 			}
 
-			// Dispose the per-indicator backend GObjects (Gio.DBusProxy,
-			// GnomeBluetooth.Client). They are created during async init after
-			// super._init() returns, so we collect at teardown (not build time)
-			// to catch every one. Must run while the actor tree is still
-			// walkable -> _popPanel() tears down before panelBox.destroy().
+			// Dispose the per-toggle Gio.DBusProxy objects. They are created
+			// during async DBus init after super._init() returns, so we collect
+			// at teardown (not build time) to catch every one. Must run while the
+			// actor tree is still walkable -> _popPanel() tears down before
+			// panelBox.destroy().
 			for (const obj of this._mmCollectDisposables()) {
 				try {
 					obj.run_dispose();
@@ -379,9 +356,7 @@ export var MultiMonitorsPanel = (() => {
 			// dominant "St.Icon already disposed" spam). It is held on a private
 			// field the actor walk doesn't reliably reach, so dispose it directly.
 			try {
-				const bt = this.statusArea?.quickSettings?._bluetooth;
-				const btClient = bt?._client;
-				console.log(`mm-diag2: bt=${!!bt} btClientType=${btClient?.constructor?.$gtype?.name}`);
+				const btClient = this.statusArea?.quickSettings?._bluetooth?._client;
 				if (btClient && typeof btClient.run_dispose === 'function')
 					btClient.run_dispose();
 			} catch (e) {
