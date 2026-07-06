@@ -357,8 +357,21 @@ export var MultiMonitorsPanel = (() => {
 			// field the actor walk doesn't reliably reach, so dispose it directly.
 			try {
 				const btClient = this.statusArea?.quickSettings?._bluetooth?._client;
-				if (btClient && typeof btClient.run_dispose === 'function')
-					btClient.run_dispose();
+				if (btClient) {
+					// Remove the client's handlers FIRST. run_dispose() emits
+					// notify::default-adapter-* as it tears down; with the
+					// handlers still attached those callbacks would fire _sync()
+					// on the already-disposed indicator (bluetooth.js:51/55/77
+					// spam). signal_handlers_destroy() drops them without
+					// emitting.
+					try {
+						GObject.signal_handlers_destroy(btClient);
+					} catch (e) {
+						// no such helper on this GObject build
+					}
+					if (typeof btClient.run_dispose === 'function')
+						btClient.run_dispose();
+				}
 			} catch (e) {
 				// quickSettings/bluetooth not present or already gone
 			}
@@ -377,12 +390,11 @@ export var MultiMonitorsPanel = (() => {
 			try {
 				for (const [emitter, tracker] of [...debugGetSignalTrackers()]) {
 					for (const owner of [...tracker._map.keys()]) {
-						if (owner instanceof Clutter.Actor && this.contains(owner)) {
-							try {
+						try {
+							if (owner instanceof Clutter.Actor && this.contains(owner))
 								disconnectObject(emitter, owner);
-							} catch (e) {
-								// emitter/owner already gone
-							}
+						} catch (e) {
+							// owner disposed (contains throws) / emitter gone
 						}
 					}
 				}
