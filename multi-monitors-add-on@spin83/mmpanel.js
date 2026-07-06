@@ -293,30 +293,6 @@ export var MultiMonitorsPanel = (() => {
 				}
 				if (children)
 					children.forEach(child => visit(child, depth + 1));
-
-				// Also descend into private actor-valued fields. Some indicators
-				// (e.g. the bluetooth SystemIndicator held by quickSettings.
-				// _bluetooth) sit in fields that get_children may not surface.
-				// Restrict to '_'-prefixed names to avoid triggering public
-				// getters with side effects.
-				let props;
-				try {
-					props = Object.getOwnPropertyNames(node);
-				} catch (e) {
-					props = [];
-				}
-				for (const p of props) {
-					if (!p.startsWith('_') || p === '__proto__')
-						continue;
-					let val;
-					try {
-						val = node[p];
-					} catch (e) {
-						continue;
-					}
-					if (val instanceof Clutter.Actor)
-						visit(val, depth + 1);
-				}
 			};
 
 			visit(this, 0);
@@ -326,10 +302,6 @@ export var MultiMonitorsPanel = (() => {
 			} catch (e) {
 				// statusArea not available; nothing to collect
 			}
-
-			const btCount = [...disposables].filter(
-				o => (o.constructor?.$gtype?.name ?? '').includes('Bluetooth')).length;
-			console.log(`mm-diag: teardown walk nodes=${seen.size} disposables=${disposables.size} bluetoothClients=${btCount}`);
 
 			return [...disposables];
 		}
@@ -399,6 +371,21 @@ export var MultiMonitorsPanel = (() => {
 				} catch (e) {
 					// already disposed
 				}
+			}
+
+			// The bluetooth SystemIndicator creates its own GnomeBluetooth.Client
+			// with plain connect()s whose ids GNOME discards; that client survives
+			// the panel and keeps firing _sync() on the disposed St.Icon (the
+			// dominant "St.Icon already disposed" spam). It is held on a private
+			// field the actor walk doesn't reliably reach, so dispose it directly.
+			try {
+				const bt = this.statusArea?.quickSettings?._bluetooth;
+				const btClient = bt?._client;
+				console.log(`mm-diag2: bt=${!!bt} btClientType=${btClient?.constructor?.$gtype?.name}`);
+				if (btClient && typeof btClient.run_dispose === 'function')
+					btClient.run_dispose();
+			} catch (e) {
+				// quickSettings/bluetooth not present or already gone
 			}
 
 			// Disconnect connectObject() handlers whose owner is one of this
