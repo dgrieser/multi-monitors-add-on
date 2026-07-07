@@ -350,27 +350,38 @@ export var MultiMonitorsPanel = (() => {
 				}
 			}
 
-			// The bluetooth SystemIndicator creates its own GnomeBluetooth.Client
-			// with plain connect()s whose ids GNOME discards; that client survives
-			// the panel and keeps firing _sync() on the disposed St.Icon (the
-			// dominant "St.Icon already disposed" spam). It is held on a private
-			// field the actor walk doesn't reliably reach, so dispose it directly.
+			// The bluetooth indicator holds a nested client graph, all created
+			// with plain connect()s whose ids GNOME discards, none disconnected
+			// on destroy -- so it survives the panel and fires on BT device /
+			// adapter events, touching the disposed indicator ("already disposed"
+			// spam):
+			//   _bluetooth._client          BtClient wrapper (GObject)
+			//   _bluetooth._client._client  GnomeBluetooth.Client (device-added/
+			//                                removed + notify::default-adapter-*)
+			//   _bluetooth._client._proxy   rfkill Gio.DBusProxy
+			// Held on private fields the actor walk doesn't reach, so dispose the
+			// whole subtree directly. For each: signal_handlers_destroy() FIRST
+			// (drop handlers silently, so run_dispose()'s own notifications can't
+			// fire an orphaned callback), then run_dispose(). Inner objects
+			// before the wrapper, since their handlers reference the wrapper.
 			try {
 				const btClient = this.statusArea?.quickSettings?._bluetooth?._client;
 				if (btClient) {
-					// Remove the client's handlers FIRST. run_dispose() emits
-					// notify::default-adapter-* as it tears down; with the
-					// handlers still attached those callbacks would fire _sync()
-					// on the already-disposed indicator (bluetooth.js:51/55/77
-					// spam). signal_handlers_destroy() drops them without
-					// emitting.
-					try {
-						GObject.signal_handlers_destroy(btClient);
-					} catch (e) {
-						// no such helper on this GObject build
+					for (const obj of [btClient._client, btClient._proxy, btClient]) {
+						if (!obj)
+							continue;
+						try {
+							GObject.signal_handlers_destroy(obj);
+						} catch (e) {
+							// no such helper / not a GObject
+						}
+						try {
+							if (typeof obj.run_dispose === 'function')
+								obj.run_dispose();
+						} catch (e) {
+							// already disposed
+						}
 					}
-					if (typeof btClient.run_dispose === 'function')
-						btClient.run_dispose();
 				}
 			} catch (e) {
 				// quickSettings/bluetooth not present or already gone
