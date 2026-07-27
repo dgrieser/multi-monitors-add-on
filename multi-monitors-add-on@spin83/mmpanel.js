@@ -214,16 +214,21 @@ export var MultiMonitorsPanel = (() => {
 			this.connect('destroy', this._onDestroy.bind(this));
 		}
 
-		// Collect per-toggle Gio.DBusProxy objects (e.g. PowerToggle._proxy
-		// watching UPower) to run_dispose() at teardown. They connect
-		// g-properties-changed -> _sync() only after their async DBus init, i.e.
-		// after super._init() returns, so the build-time capture never sees
-		// them; they are private to each duplicated toggle, so disposing is safe.
-		// (The bluetooth SystemIndicator's own client sits on a private field the
-		// walk doesn't reach -- it's disposed directly in _mmTeardown. Shared
-		// singletons -- NM client, Gvc mixer -- are never disposed; their leaked
-		// handlers are cleaned by owner via the signal tracker in _mmTeardown.)
-		_mmCollectDisposables() {
+		// One walk of the panel, its status area, and their menus. Returns:
+		//   disposables - per-toggle Gio.DBusProxy objects (e.g. PowerToggle.
+		//                 _proxy watching UPower), created after super._init()
+		//                 returns so the build capture misses them; private to
+		//                 each duplicated toggle, so run_dispose() is safe.
+		//   owned       - the set of every node visited. Used in _mmTeardown to
+		//                 recognise connectObject() owners that belong to us --
+		//                 including the quick-settings *menu items* (the volume
+		//                 stream sliders), which live in the popup menu and are
+		//                 therefore NOT this.contains()-descendants of the panel.
+		// (The bluetooth client sits on a private field the walk doesn't reach --
+		// disposed directly in _mmTeardown. Shared singletons -- NM client, Gvc
+		// mixer, streams -- are never disposed; their leaked handlers are cleaned
+		// by owner via the signal tracker in _mmTeardown.)
+		_mmWalkPanel() {
 			const disposables = new Set();
 			const seen = new Set();
 
@@ -280,7 +285,7 @@ export var MultiMonitorsPanel = (() => {
 				// statusArea not available; nothing to collect
 			}
 
-			return [...disposables];
+			return { disposables: [...disposables], owned: seen };
 		}
 
 		_mmTeardown() {
@@ -337,12 +342,12 @@ export var MultiMonitorsPanel = (() => {
 				this._mmCapturedConnections = null;
 			}
 
-			// Dispose the per-toggle Gio.DBusProxy objects. They are created
-			// during async DBus init after super._init() returns, so we collect
-			// at teardown (not build time) to catch every one. Must run while the
-			// actor tree is still walkable -> _popPanel() tears down before
+			// Walk the panel once: collect DBus proxies to dispose, and the set
+			// of nodes we own (for the connectObject cleanup below). Must run
+			// while the tree is still walkable -> _popPanel() tears down before
 			// panelBox.destroy().
-			for (const obj of this._mmCollectDisposables()) {
+			const { disposables, owned } = this._mmWalkPanel();
+			for (const obj of disposables) {
 				try {
 					obj.run_dispose();
 				} catch (e) {
@@ -387,25 +392,28 @@ export var MultiMonitorsPanel = (() => {
 				// quickSettings/bluetooth not present or already gone
 			}
 
-			// Disconnect connectObject() handlers whose owner is one of this
-			// panel's actors, across every emitter. The async-built indicators
-			// register handlers on SHARED singletons via connectObject with the
-			// indicator/slider as owner: volume -> Gvc mixer control, network ->
-			// NM.Client, the stream sliders -> their streams. The emitter's
-			// signal tracker keeps that owner as a Map key, so it never
-			// finalizes after the panel dies and its handlers keep firing on the
-			// disposed St.Icon (the volume.js / network.js spam). Untracking by
-			// owner disconnects them and releases the owner. We only touch owners
-			// contained in THIS panel, so the real panel's indicators (whose
-			// owners live elsewhere) are never affected.
+			// Disconnect connectObject() handlers whose owner is one of OUR nodes,
+			// across every emitter. The async-built indicators register handlers
+			// on SHARED singletons via connectObject with the indicator/slider as
+			// owner: volume -> Gvc mixer control + per-device streams, network ->
+			// NM.Client. The emitter's signal tracker keeps that owner as a Map
+			// key, so it never finalizes after the panel dies and its handlers
+			// keep firing on the disposed St.Icon (the volume.js / network.js
+			// spam). We match owners against `owned` (the walk's visited set)
+			// rather than this.contains(): the volume sliders live in the popup
+			// menu, not the panel actor, so contains() missed them (that was the
+			// unfixed leak) -- and Set.has() never touches a disposed wrapper, so
+			// it can't spam. Only our owners are touched; the real panel's
+			// indicators (different owner objects) are never affected.
 			try {
 				for (const [emitter, tracker] of [...debugGetSignalTrackers()]) {
 					for (const owner of [...tracker._map.keys()]) {
-						try {
-							if (owner instanceof Clutter.Actor && this.contains(owner))
+						if (owned.has(owner)) {
+							try {
 								disconnectObject(emitter, owner);
-						} catch (e) {
-							// owner disposed (contains throws) / emitter gone
+							} catch (e) {
+								// emitter/owner already gone
+							}
 						}
 					}
 				}
