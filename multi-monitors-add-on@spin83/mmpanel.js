@@ -183,19 +183,26 @@ export var MultiMonitorsPanel = (() => {
 				super._init();
 			});
 
-			// Some captured targets are actors GNOME disposes during the
-			// panel's life (e.g. the keyboard LayoutMenuItem, rebuilt on every
-			// input-source change). Watch each actor target's 'destroy' and mark
-			// its entry dead, so teardown never touches a freed wrapper -- that
-			// was the "already disposed" / "no handler with id" spam. Long-lived
-			// actor targets (the genuine leaks, e.g. handlers left on the real
-			// panel) are never destroyed, so their entries survive to teardown
-			// and get disconnected. Non-actor singletons need no watch.
+			// Some captured targets are disposed by GNOME during the panel's
+			// life (the keyboard LayoutMenuItem rebuilt on input-source change;
+			// a MessageTray.Notification dismissed by the user). Watch their
+			// 'destroy' signal and mark the entry dead, so teardown never probes
+			// a freed wrapper -- that was the "already disposed"/"no handler"
+			// spam. Any GObject that has a 'destroy' signal qualifies (all
+			// actors, plus non-actor objects like Notification). Long-lived
+			// singletons (never destroyed) survive to teardown and get
+			// disconnected. EventEmitters aren't GObjects -> no watch, fine.
 			for (const entry of this._mmCapturedConnections) {
-				if (entry.target instanceof Clutter.Actor)
-					entry.watchId = entry.target.connect('destroy', () => {
-						entry.dead = true;
-					});
+				const t = entry.target;
+				try {
+					if (t instanceof GObject.Object &&
+						GObject.signal_lookup('destroy', t.constructor.$gtype))
+						entry.watchId = t.connect('destroy', () => {
+							entry.dead = true;
+						});
+				} catch (e) {
+					// target has no 'destroy' signal / not introspectable
+				}
 			}
 
 			// Capture sessionMode connects made by the async-built indicators
@@ -355,6 +362,37 @@ export var MultiMonitorsPanel = (() => {
 				}
 			}
 
+			// Disconnect connectObject() handlers whose owner is one of OUR nodes,
+			// across every emitter. The async-built indicators register handlers
+			// on SHARED singletons via connectObject with the indicator/slider as
+			// owner: volume -> Gvc mixer control + per-device streams, network ->
+			// NM.Client. The emitter's signal tracker keeps that owner as a Map
+			// key, so it never finalizes after the panel dies and its handlers
+			// keep firing on the disposed St.Icon (the volume.js / network.js
+			// spam). We match owners against `owned` (the walk's visited set)
+			// rather than this.contains(): the volume sliders live in the popup
+			// menu, not the panel actor, so contains() missed them (that was the
+			// unfixed leak) -- and Set.has() never touches a disposed wrapper, so
+			// it can't spam. Only our owners are touched; the real panel's
+			// indicators (different owner objects) are never affected. Runs
+			// BEFORE the bluetooth disposal below, so it never untracks the
+			// BtClient after that block has already disposed it.
+			try {
+				for (const [emitter, tracker] of [...debugGetSignalTrackers()]) {
+					for (const owner of [...tracker._map.keys()]) {
+						if (owned.has(owner)) {
+							try {
+								disconnectObject(emitter, owner);
+							} catch (e) {
+								// emitter/owner already gone
+							}
+						}
+					}
+				}
+			} catch (e) {
+				// signalTracker debug internals unavailable / changed
+			}
+
 			// The bluetooth indicator holds a nested client graph, all created
 			// with plain connect()s whose ids GNOME discards, none disconnected
 			// on destroy -- so it survives the panel and fires on BT device /
@@ -390,35 +428,6 @@ export var MultiMonitorsPanel = (() => {
 				}
 			} catch (e) {
 				// quickSettings/bluetooth not present or already gone
-			}
-
-			// Disconnect connectObject() handlers whose owner is one of OUR nodes,
-			// across every emitter. The async-built indicators register handlers
-			// on SHARED singletons via connectObject with the indicator/slider as
-			// owner: volume -> Gvc mixer control + per-device streams, network ->
-			// NM.Client. The emitter's signal tracker keeps that owner as a Map
-			// key, so it never finalizes after the panel dies and its handlers
-			// keep firing on the disposed St.Icon (the volume.js / network.js
-			// spam). We match owners against `owned` (the walk's visited set)
-			// rather than this.contains(): the volume sliders live in the popup
-			// menu, not the panel actor, so contains() missed them (that was the
-			// unfixed leak) -- and Set.has() never touches a disposed wrapper, so
-			// it can't spam. Only our owners are touched; the real panel's
-			// indicators (different owner objects) are never affected.
-			try {
-				for (const [emitter, tracker] of [...debugGetSignalTrackers()]) {
-					for (const owner of [...tracker._map.keys()]) {
-						if (owned.has(owner)) {
-							try {
-								disconnectObject(emitter, owner);
-							} catch (e) {
-								// emitter/owner already gone
-							}
-						}
-					}
-				}
-			} catch (e) {
-				// signalTracker debug internals unavailable / changed
 			}
 		}
 
