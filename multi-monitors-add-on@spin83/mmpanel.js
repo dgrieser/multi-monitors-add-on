@@ -22,7 +22,14 @@ import GObject from 'gi://GObject';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as Panel from 'resource:///org/gnome/shell/ui/panel.js';
 import { EventEmitter } from 'resource:///org/gnome/shell/misc/signals.js';
-import { disconnectObject, debugGetSignalTrackers } from 'resource:///org/gnome/shell/misc/signalTracker.js';
+// Namespace import on purpose. `debugGetSignalTrackers` is documented upstream
+// as a debug helper, so it carries no API-stability promise -- unlike
+// `disconnectObject` beside it. A named import binds at module link time, so
+// the day GNOME renames or drops that helper an `import { ... }` would fail to
+// resolve and take the WHOLE extension down, not just the cleanup that uses it.
+// Through a namespace the missing export is merely `undefined`, checked for at
+// the point of use, and everything else keeps working.
+import * as SignalTracker from 'resource:///org/gnome/shell/misc/signalTracker.js';
 
 // --- Signal-leak guard -----------------------------------------------------
 //
@@ -378,13 +385,18 @@ export var MultiMonitorsPanel = (() => {
 			// BEFORE the bluetooth disposal below, so it never untracks the
 			// BtClient after that block has already disposed it.
 			try {
-				for (const [emitter, tracker] of [...debugGetSignalTrackers()]) {
-					for (const owner of [...tracker._map.keys()]) {
-						if (owned.has(owner)) {
-							try {
-								disconnectObject(emitter, owner);
-							} catch (e) {
-								// emitter/owner already gone
+				const getSignalTrackers = SignalTracker.debugGetSignalTrackers;
+				const disconnectObject = SignalTracker.disconnectObject;
+				if (typeof getSignalTrackers === 'function' &&
+					typeof disconnectObject === 'function') {
+					for (const [emitter, tracker] of [...getSignalTrackers()]) {
+						for (const owner of [...tracker._map.keys()]) {
+							if (owned.has(owner)) {
+								try {
+									disconnectObject(emitter, owner);
+								} catch (e) {
+									// emitter/owner already gone
+								}
 							}
 						}
 					}
