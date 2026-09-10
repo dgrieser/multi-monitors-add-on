@@ -339,7 +339,19 @@ export var MultiMonitorsPanel = (() => {
 						continue;
 					try {
 						// The actor is still alive -- drop our destroy watch.
-						if (watchId)
+						// Needs the same staleness check as the captured id
+						// below: run_dispose() and signal_handlers_destroy()
+						// drop every handler WITHOUT emitting 'destroy', so the
+						// dead flag never gets set and both ids go stale behind
+						// our back. That happens routinely here -- an earlier
+						// panel's teardown disposes the DBus proxies and the
+						// bluetooth subtree that a later panel also captured.
+						// Unguarded, this logged a "no handler with id" warning
+						// per entry on every panel teardown. watchId is only
+						// ever set on GObject targets (see _init), so the
+						// instanceof test the id needs is redundant for it.
+						if (watchId &&
+							GObject.signal_handler_is_connected(target, watchId))
 							target.disconnect(watchId);
 						// For a live GObject, skip a stale id so disconnect()
 						// can't raise a "no handler with id" critical. EventEmitter
