@@ -373,13 +373,6 @@ export var MultiMonitorsPanel = (() => {
 			// while the tree is still walkable -> _popPanel() tears down before
 			// panelBox.destroy().
 			const { disposables, owned } = this._mmWalkPanel();
-			for (const obj of disposables) {
-				try {
-					obj.run_dispose();
-				} catch (e) {
-					// already disposed
-				}
-			}
 
 			// Disconnect connectObject() handlers whose owner is one of OUR nodes,
 			// across every emitter. The async-built indicators register handlers
@@ -393,9 +386,16 @@ export var MultiMonitorsPanel = (() => {
 			// menu, not the panel actor, so contains() missed them (that was the
 			// unfixed leak) -- and Set.has() never touches a disposed wrapper, so
 			// it can't spam. Only our owners are touched; the real panel's
-			// indicators (different owner objects) are never affected. Runs
-			// BEFORE the bluetooth disposal below, so it never untracks the
-			// BtClient after that block has already disposed it.
+			// indicators (different owner objects) are never affected.
+			//
+			// Runs BEFORE both disposal blocks below. run_dispose() and
+			// signal_handlers_destroy() drop an object's handlers without
+			// telling the emitter's signal tracker, which still holds the ids.
+			// Disconnecting afterwards therefore hands disconnect() ids the
+			// emitter no longer has, once per tracked handler:
+			//   gsignal.c: instance '0x...' has no handler with id 'N'
+			// Untrack first, dispose second, and the tracker is always acting on
+			// handlers that are still live.
 			try {
 				const getSignalTrackers = SignalTracker.debugGetSignalTrackers;
 				const disconnectObject = SignalTracker.disconnectObject;
@@ -415,6 +415,15 @@ export var MultiMonitorsPanel = (() => {
 				}
 			} catch (e) {
 				// signalTracker debug internals unavailable / changed
+			}
+
+			// Now safe to dispose: nothing tracked still points at these.
+			for (const obj of disposables) {
+				try {
+					obj.run_dispose();
+				} catch (e) {
+					// already disposed
+				}
 			}
 
 			// The bluetooth indicator holds a nested client graph, all created
