@@ -310,6 +310,9 @@ export var MultiMonitorsPanel = (() => {
 				return;
 			this._mmTornDown = true;
 
+			// MMDBG: temporary instrumentation, remove before merging.
+			console.log('MMDBG 1 start');
+
 			// Balance the sessionMode capture. If the drain idle is still
 			// pending (panel destroyed before construction settled), cancel it
 			// and release our ref now so the instance patch is restored.
@@ -321,39 +324,69 @@ export var MultiMonitorsPanel = (() => {
 			// Disconnect the async-built indicators' sessionMode handlers that
 			// would otherwise fire on this now-disposed panel at the next lock.
 			_disconnectSessionCaptures();
+			console.log('MMDBG 2 after-sessionMode');
 
 			if (this._mmCapturedConnections) {
+				let mmdbgTotal = 0, mmdbgDead = 0, mmdbgProxy = 0,
+					mmdbgWatch = 0, mmdbgStale = 0, mmdbgDisc = 0, mmdbgNonGO = 0;
 				for (const entry of this._mmCapturedConnections) {
 					const { target, id, watchId, dead } = entry;
+					mmdbgTotal++;
 					// Actor target already destroyed during the panel's life:
 					// its handlers went with it, so there is nothing to undo and
 					// touching the freed wrapper would only spam.
-					if (dead)
+					if (dead) {
+						mmdbgDead++;
 						continue;
+					}
 					// Gio.DBusProxy targets are reaped wholesale by run_dispose()
 					// below. A proxy recreated/disposed mid-life has no 'destroy'
 					// signal to prune it via the dead flag, so probing it here
 					// with signal_handler_is_connected() would spam "already
 					// disposed". Skip them; run_dispose() covers the live ones.
-					if (target instanceof Gio.DBusProxy)
+					if (target instanceof Gio.DBusProxy) {
+						mmdbgProxy++;
 						continue;
+					}
 					try {
 						// The actor is still alive -- drop our destroy watch.
-						if (watchId)
+						// Needs the same staleness check as the captured id
+						// below: run_dispose() and signal_handlers_destroy()
+						// drop every handler WITHOUT emitting 'destroy', so the
+						// dead flag never gets set and both ids go stale behind
+						// our back. That happens routinely here -- an earlier
+						// panel's teardown disposes the DBus proxies and the
+						// bluetooth subtree that a later panel also captured.
+						// Unguarded, this logged a "no handler with id" warning
+						// per entry on every panel teardown. watchId is only
+						// ever set on GObject targets (see _init), so the
+						// instanceof test the id needs is redundant for it.
+						if (watchId &&
+							GObject.signal_handler_is_connected(target, watchId)) {
+							mmdbgWatch++;
 							target.disconnect(watchId);
+						}
 						// For a live GObject, skip a stale id so disconnect()
 						// can't raise a "no handler with id" critical. EventEmitter
 						// targets short-circuit past this and disconnect directly
 						// (a safe no-op if the handler is already gone).
 						if (target instanceof GObject.Object &&
-							!GObject.signal_handler_is_connected(target, id))
+							!GObject.signal_handler_is_connected(target, id)) {
+							mmdbgStale++;
 							continue;
+						}
+						if (!(target instanceof GObject.Object))
+							mmdbgNonGO++;
+						mmdbgDisc++;
 						target.disconnect(id);
 					} catch (e) {
 						// target already disposed / id already gone
 					}
 				}
 				this._mmCapturedConnections = null;
+				console.log(`MMDBG 3 after-captured total=${mmdbgTotal} dead=${mmdbgDead}`
+					+ ` proxy=${mmdbgProxy} watchDisc=${mmdbgWatch} staleSkip=${mmdbgStale}`
+					+ ` disc=${mmdbgDisc} nonGObject=${mmdbgNonGO}`);
 			}
 
 			// Walk the panel once: collect DBus proxies to dispose, and the set
@@ -361,13 +394,7 @@ export var MultiMonitorsPanel = (() => {
 			// while the tree is still walkable -> _popPanel() tears down before
 			// panelBox.destroy().
 			const { disposables, owned } = this._mmWalkPanel();
-			for (const obj of disposables) {
-				try {
-					obj.run_dispose();
-				} catch (e) {
-					// already disposed
-				}
-			}
+			console.log(`MMDBG 4 after-walk disposables=${disposables.length} owned=${owned.size}`);
 
 			// Disconnect connectObject() handlers whose owner is one of OUR nodes,
 			// across every emitter. The async-built indicators register handlers
@@ -381,9 +408,17 @@ export var MultiMonitorsPanel = (() => {
 			// menu, not the panel actor, so contains() missed them (that was the
 			// unfixed leak) -- and Set.has() never touches a disposed wrapper, so
 			// it can't spam. Only our owners are touched; the real panel's
-			// indicators (different owner objects) are never affected. Runs
-			// BEFORE the bluetooth disposal below, so it never untracks the
-			// BtClient after that block has already disposed it.
+			// indicators (different owner objects) are never affected.
+			//
+			// Runs BEFORE both disposal blocks below. run_dispose() and
+			// signal_handlers_destroy() drop an object's handlers without
+			// telling the emitter's signal tracker, which still holds the ids.
+			// Disconnecting afterwards therefore hands disconnect() ids the
+			// emitter no longer has, once per tracked handler:
+			//   gsignal.c: instance '0x...' has no handler with id 'N'
+			// Untrack first, dispose second, and the tracker is always acting on
+			// handlers that are still live.
+			let mmdbgSweep = 0;
 			try {
 				const getSignalTrackers = SignalTracker.debugGetSignalTrackers;
 				const disconnectObject = SignalTracker.disconnectObject;
@@ -393,6 +428,7 @@ export var MultiMonitorsPanel = (() => {
 						for (const owner of [...tracker._map.keys()]) {
 							if (owned.has(owner)) {
 								try {
+									mmdbgSweep++;
 									disconnectObject(emitter, owner);
 								} catch (e) {
 									// emitter/owner already gone
@@ -404,6 +440,17 @@ export var MultiMonitorsPanel = (() => {
 			} catch (e) {
 				// signalTracker debug internals unavailable / changed
 			}
+			console.log(`MMDBG 5 after-sweep untracked=${mmdbgSweep}`);
+
+			// Now safe to dispose: nothing tracked still points at these.
+			for (const obj of disposables) {
+				try {
+					obj.run_dispose();
+				} catch (e) {
+					// already disposed
+				}
+			}
+			console.log('MMDBG 6 after-proxy-dispose');
 
 			// The bluetooth indicator holds a nested client graph, all created
 			// with plain connect()s whose ids GNOME discards, none disconnected
@@ -441,6 +488,7 @@ export var MultiMonitorsPanel = (() => {
 			} catch (e) {
 				// quickSettings/bluetooth not present or already gone
 			}
+			console.log('MMDBG 7 after-bluetooth');
 		}
 
 		_onDestroy() {
